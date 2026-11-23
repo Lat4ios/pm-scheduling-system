@@ -6,6 +6,10 @@
  The application creates pm_schedule_data.json beside this file.
 */
 declare(strict_types=1);
+
+// PHPMailer is installed during the Docker image build.
+$composerAutoload = __DIR__ . '/vendor/autoload.php';
+if (is_file($composerAutoload)) { require_once $composerAutoload; }
 $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
 session_set_cookie_params([
     'lifetime' => 0,
@@ -496,13 +500,50 @@ function sendDueEmailNotifications(array &$data, bool $force=false): array {
     if (!$due) return ['sent'=>0,'failed'=>0,'due'=>0];
     $subject='PM Advance Alarm / Due Notification - WW'.str_pad((string)$workWeek,2,'0',STR_PAD_LEFT);
     $message="Preventive Maintenance alarms due within 2 days or overdue for WW".str_pad((string)$workWeek,2,'0',STR_PAD_LEFT)."\n\n".implode("\n",$due)."\n\nGenerated: ".date('d/m/Y H:i:s').' IST';
-    $headers="From: Preventive Maintenance Electronic System <pm-schedule@localhost>\r\nContent-Type: text/plain; charset=UTF-8"; $sent=0; $failed=0;
+    $sent=0; $failed=0;
     if (!isset($data['email_delivery']) || !is_array($data['email_delivery'])) $data['email_delivery']=[];
+    $smtpHost=trim((string)(getenv('SMTP_HOST') ?: 'smtp-relay.brevo.com'));
+    $smtpPort=(int)(getenv('SMTP_PORT') ?: 587);
+    $smtpUsername=trim((string)getenv('SMTP_USERNAME'));
+    $smtpPassword=(string)getenv('SMTP_PASSWORD');
+    $smtpEncryption=strtolower(trim((string)(getenv('SMTP_ENCRYPTION') ?: 'tls')));
+    $fromEmail=trim((string)getenv('SMTP_FROM_EMAIL'));
+    $fromName=trim((string)(getenv('SMTP_FROM_NAME') ?: 'PM Scheduling System'));
+    $smtpConfigured=class_exists(\PHPMailer\PHPMailer\PHPMailer::class)
+        && $smtpHost!=='' && $smtpPort>0 && $smtpUsername!=='' && $smtpPassword!==''
+        && filter_var($fromEmail,FILTER_VALIDATE_EMAIL) && in_array($smtpEncryption,['tls','ssl'],true);
     foreach ($data['users'] as $user) {
         $email=(string)($user['email']??''); if (($user['status']??'')!=='approved' || empty($user['email_notifications']) || !filter_var($email,FILTER_VALIDATE_EMAIL)) continue;
         $deliveryKey=$today.'|'.strtolower($email);
         if (!$force && isset($data['email_delivery'][$deliveryKey])) continue;
-        $ok=@mail($email,$subject,$message,$headers); $ok?$sent++:$failed++;
+        $ok=false;
+        if (!$smtpConfigured) {
+            error_log('PM email not sent: Brevo SMTP is not fully configured. Check SMTP_* environment variables and PHPMailer installation.');
+        } else {
+            try {
+                $mailer=new \PHPMailer\PHPMailer\PHPMailer(true);
+                $mailer->isSMTP();
+                $mailer->Host=$smtpHost;
+                $mailer->SMTPAuth=true;
+                $mailer->Username=$smtpUsername;
+                $mailer->Password=$smtpPassword;
+                $mailer->Port=$smtpPort;
+                $mailer->SMTPSecure=$smtpEncryption=== 'ssl'
+                    ? \PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_SMTPS
+                    : \PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_STARTTLS;
+                $mailer->CharSet='UTF-8';
+                $mailer->setFrom($fromEmail,$fromName);
+                $mailer->addAddress($email);
+                $mailer->Subject=$subject;
+                $mailer->Body=$message;
+                $mailer->isHTML(false);
+                $mailer->send();
+                $ok=true;
+            } catch (\Throwable $mailError) {
+                error_log('PM Brevo SMTP delivery failed for '. $email . ': ' . $mailError->getMessage());
+            }
+        }
+        $ok?$sent++:$failed++;
         $data['email_delivery'][$deliveryKey]=['timestamp'=>date('c'),'status'=>$ok?'sent':'failed','due_count'=>count($due)];
     }
     return ['sent'=>$sent,'failed'=>$failed,'due'=>count($due)];
@@ -1399,7 +1440,7 @@ table{border-collapse:separate;border-spacing:0;min-width:2400px;width:100%;font
 <section class="panel"><h2>My Profile</h2><div style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap"><?php if(!empty($currentUser['photo'])):?><img class="approval-photo" style="width:120px;height:120px" src="<?=e($currentUser['photo'])?>" alt="Profile photo"><?php endif;?><form method="post" enctype="multipart/form-data" class="grid" style="max-width:720px;flex:1"><input type="hidden" name="action" value="update_profile"><label class="field">Name<input value="<?=e($currentUser['name'])?>" readonly></label><label class="field">Employee No.<input value="<?=e($currentUser['employee_no'])?>" readonly></label><label class="field">Designation<input value="<?=e($currentUser['designation'])?>" readonly></label><label class="field">Email Address<input type="email" name="email" value="<?=e((string)($currentUser['email']??''))?>" required></label><label class="field full"><span><input type="checkbox" name="email_notifications" value="1" <?=!empty($currentUser['email_notifications'])?'checked':''?>> Receive PM due email notifications</span></label><label class="field full">Upload New Profile Photo<input type="file" name="profile_photo" accept="image/jpeg,image/png,image/webp"><small>Leave blank to keep the current photo. Maximum 2 MB.</small></label><span></span><button>Update Profile</button></form></div></section>
 <section class="panel" style="margin-top:16px"><h2>Change My Password</h2><form method="post" class="grid" style="max-width:720px"><input type="hidden" name="action" value="change_own_password"><label class="field full">Current Password<input type="password" name="current_password" required></label><label class="field">New Password<input type="password" name="new_password" minlength="8" required></label><label class="field">Confirm New Password<input type="password" name="confirm_password" minlength="8" required></label><span></span><button>Change Password</button></form></section>
 <?php else:?>
-<section class="panel"><h2>PM Due Email Notifications</h2><p>The system sends one daily WW due-list email to every approved user who enabled notifications. XAMPP must have PHP mail configured in <code>php.ini</code> and <code>sendmail.ini</code>.</p><form method="post"><input type="hidden" name="action" value="send_due_email"><button>Send Due Email Now</button></form></section>
+<section class="panel"><h2>PM Due Email Notifications</h2><p>The system sends one daily WW due-list email to every approved user who enabled notifications. Render must have valid Brevo SMTP environment variables configured. Use the button below to send a test due-list notification when items are due.</p><form method="post"><input type="hidden" name="action" value="send_due_email"><button>Send Due Email Now</button></form></section>
 <section class="panel" style="margin-top:16px"><h2>User Enrollment Approval and Accounts</h2><div class="table-wrap" style="max-height:none"><table class="due-table"><thead><tr><th>Photo</th><th>Name</th><th>Employee No.</th><th>Email</th><th>Notify</th><th>Designation</th><th>Requested</th><th>Status</th><th>Approval / Password Reset</th></tr></thead><tbody>
 <?php foreach($data['users'] as $user):if((int)$user['id']===(int)$currentUser['id'])continue;?><tr><td><?php if(!empty($user['photo'])):?><img class="approval-photo" src="<?=e($user['photo'])?>" alt="<?=e($user['name'])?> photo"><?php else:?>No photo<?php endif;?></td><td><?=e($user['name'])?></td><td><?=e($user['employee_no'])?></td><td><?=e((string)($user['email']??''))?></td><td><?=!empty($user['email_notifications'])?'Yes':'No'?></td><td><?=e($user['designation'])?></td><td><?=e(date('d/m/Y H:i',strtotime($user['created_at'])))?></td><td><span class="badge <?=($user['status']==='approved'?'status-done':($user['status']==='pending'?'f-H':'status-due'))?>"><?=e(ucfirst($user['status']))?></span></td><td><?php if($user['status']==='pending'):?><div class="actions"><form method="post"><input type="hidden" name="action" value="approve_user"><input type="hidden" name="user_id" value="<?=$user['id']?>"><button>Approve</button></form><form method="post"><input type="hidden" name="action" value="reject_user"><input type="hidden" name="user_id" value="<?=$user['id']?>"><button class="btn danger">Reject</button></form></div><?php elseif($user['status']==='approved'):?><form method="post" class="actions" onsubmit="return confirm('Reset this user password?')"><input type="hidden" name="action" value="reset_user_password"><input type="hidden" name="user_id" value="<?=$user['id']?>"><input type="password" name="new_password" minlength="8" placeholder="New password" required><button>Reset Password</button></form><?php else:?>—<?php endif;?></td></tr><?php endforeach;?>
 </tbody></table></div></section>

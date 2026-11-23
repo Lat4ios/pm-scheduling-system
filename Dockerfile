@@ -1,5 +1,7 @@
 FROM php:8.4-apache
 
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+
 RUN a2enmod headers expires \
     && sed -i 's/Listen 80/Listen 10000/' /etc/apache2/ports.conf \
     && sed -i 's/<VirtualHost \*:80>/<VirtualHost *:10000>/' /etc/apache2/sites-available/000-default.conf \
@@ -8,6 +10,9 @@ RUN a2enmod headers expires \
     && a2enconf pmsched-security
 
 WORKDIR /var/www/html
+COPY composer.json /var/www/html/composer.json
+RUN composer install --no-dev --no-interaction --prefer-dist --optimize-autoloader \
+    && composer clear-cache
 COPY PMsched.php /var/www/html/index.php
 # Seed data is stored outside Apache's public document root.
 RUN mkdir -p /opt/pmsched-seed /var/data
