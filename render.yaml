@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: pm-scheduling-system
+    runtime: docker
+    plan: starter
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: PM_DATA_DIR
+        value: /var/data
+      - key: PM_TIMEZONE
+        value: Asia/Kolkata
+      - key: PM_ADMIN_INITIAL_PASSWORD
+        sync: false
+    disk:
+      name: pm-schedule-data
+      mountPath: /var/data
+      sizeGB: 1
