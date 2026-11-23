@@ -19,8 +19,8 @@ session_set_cookie_params([
     'samesite' => 'Lax',
 ]);
 session_start();
-// All system timestamps use the configured company timezone (Philippine Time by default).
-date_default_timezone_set(getenv('PM_TIMEZONE') ?: 'Asia/Manila');
+// All system timestamps and reminder dates use Ahmedabad, India time by default.
+date_default_timezone_set(getenv('PM_TIMEZONE') ?: 'Asia/Kolkata');
 
 // On Render, keep all mutable data on the attached persistent disk.
 $dataDirectory = rtrim(getenv('PM_DATA_DIR') ?: __DIR__, DIRECTORY_SEPARATOR);
@@ -545,40 +545,88 @@ function sendBrevoTransactionalEmail(string $recipient, string $recipientName, s
 }
 
 function sendDueEmailNotifications(array &$data, bool $force=false): array {
-    $year=(int)$data['year']; $workWeek=(int)date('W'); $today=date('Y-m-d'); $completed=[]; $due=[];
-    foreach (($data['logs']??[]) as $log) if ((int)($log['year']??0)===$year) $completed[$log['equipment_id'].'-'.$log['week']]=true;
-    foreach ($data['equipment'] as $eq) {
-        $frequency=(string)($eq['schedule'][$workWeek-1]??'');
-        $dueDate=(string)($eq['due_dates'][$workWeek-1]??'');
-        if (($eq['schedule_mode']??'')!=='enrollment_combined' && ($frequency==='' || $dueDate==='')) {
-            $frequency=(string)($eq['planned_frequency']??'');
-            $dueDate=dueOccurrenceForWorkWeek((string)($eq['planned_due_date']??''),$frequency,$year,$workWeek)??'';
-        }
-        if ($dueDate!=='' && $frequency!=='' && !isset($completed[$eq['id'].'-'.$workWeek])) {
-            $daysRemaining=(int)(new DateTimeImmutable($today))->diff(new DateTimeImmutable($dueDate))->format('%r%a');
-            if ($daysRemaining<=2) { $alarmLabel=$daysRemaining<0?'OVERDUE':($daysRemaining===0?'DUE TODAY':'DUE IN '.$daysRemaining.' DAY'.($daysRemaining===1?'':'S')); $due[]=$alarmLabel.' | '.$eq['code'].' | '.$eq['name'].' | '.$dueDate.' | '.frequencyName($frequency); }
-        }
+    $today=date('Y-m-d');
+    $year=(int)($data['year']??date('Y'));
+    $completed=[];
+    foreach (($data['logs']??[]) as $log) {
+        if ((int)($log['year']??0)===$year) $completed[(int)($log['equipment_id']??0).'-'.(int)($log['week']??0)]=true;
     }
-    if (!$due) return ['sent'=>0,'failed'=>0,'due'=>0];
-    $subject='PM Advance Alarm / Due Notification - WW'.str_pad((string)$workWeek,2,'0',STR_PAD_LEFT);
-    $message="Preventive Maintenance alarms due within 2 days or overdue for WW".str_pad((string)$workWeek,2,'0',STR_PAD_LEFT)."\n\n".implode("\n",$due)."\n\nGenerated: ".date('d/m/Y H:i:s').' PHT';
-    $sent=0; $failed=0;
+
+    // Three independent reminder stages. Each task/recipient/stage has its own
+    // delivery key, so a daily cron retry cannot resend a successful reminder.
+    $stages=[7=>'7-DAY ADVANCE REMINDER',2=>'2-DAY ADVANCE REMINDER',0=>'DUE TODAY'];
+    $pending=[];
     if (!isset($data['email_delivery']) || !is_array($data['email_delivery'])) $data['email_delivery']=[];
-    foreach ($data['users'] as $user) {
-        $email=(string)($user['email']??''); if (($user['status']??'')!=='approved' || empty($user['email_notifications']) || !filter_var($email,FILTER_VALIDATE_EMAIL)) continue;
-        $deliveryKey=$today.'|'.strtolower($email);
-        if (!$force && isset($data['email_delivery'][$deliveryKey])) continue;
-        $result=sendBrevoTransactionalEmail($email,(string)($user['name']??''),$subject,$message);
-        $result['ok']?$sent++:$failed++;
-        if (!$result['ok']) error_log('PM Brevo API delivery failed for '.$email.': '.$result['message']);
-        $data['email_delivery'][$deliveryKey]=['timestamp'=>date('c'),'status'=>$result['ok']?'sent':'failed','due_count'=>count($due)];
+
+    foreach (($data['equipment']??[]) as $eq) {
+        $equipmentId=(int)($eq['id']??0);
+        for ($week=1;$week<=52;$week++) {
+            $frequency=(string)($eq['schedule'][$week-1]??'');
+            $dueDate=(string)($eq['due_dates'][$week-1]??'');
+            if (($eq['schedule_mode']??'')!=='enrollment_combined' && ($frequency==='' || $dueDate==='')) {
+                $frequency=(string)($eq['planned_frequency']??'');
+                $dueDate=dueOccurrenceForWorkWeek((string)($eq['planned_due_date']??''),$frequency,$year,$week)??'';
+            }
+            if ($frequency==='' || $dueDate==='' || isset($completed[$equipmentId.'-'.$week])) continue;
+            if (!preg_match('/^\d{4}-\d{2}-\d{2}$/',$dueDate)) continue;
+            $daysRemaining=(int)(new DateTimeImmutable($today))->diff(new DateTimeImmutable($dueDate))->format('%r%a');
+            if (!array_key_exists($daysRemaining,$stages)) continue;
+            $stage=$daysRemaining;
+            $taskKey=$equipmentId.'|'.$dueDate.'|'.$stage;
+            $pending[$stage][$taskKey]=[
+                'equipment_id'=>$equipmentId,
+                'week'=>$week,
+                'code'=>(string)($eq['code']??''),
+                'name'=>(string)($eq['name']??''),
+                'due_date'=>$dueDate,
+                'frequency'=>frequencyName($frequency),
+            ];
+        }
     }
-    return ['sent'=>$sent,'failed'=>$failed,'due'=>count($due)];
+
+    $sent=0; $failed=0; $dueCount=0;
+    foreach ($pending as $stage=>$tasks) $dueCount+=count($tasks);
+    if ($force && !$pending) return ['sent'=>0,'failed'=>0,'due'=>0];
+
+    foreach (($data['users']??[]) as $user) {
+        $email=(string)($user['email']??'');
+        if (($user['status']??'')!=='approved' || empty($user['email_notifications']) || !filter_var($email,FILTER_VALIDATE_EMAIL)) continue;
+        foreach ($pending as $stage=>$tasks) {
+            $undelivered=[];
+            foreach ($tasks as $taskKey=>$task) {
+                $deliveryKey=$today.'|'.strtolower($email).'|'.$taskKey;
+                if (!isset($data['email_delivery'][$deliveryKey])) $undelivered[$taskKey]=$task;
+            }
+            if (!$undelivered) continue;
+            $stageLabel=$stages[$stage];
+            $subject='PM '.$stageLabel.' - '.count($undelivered).' item(s)';
+            $lines=[];
+            foreach ($undelivered as $task) {
+                $lines[]=$task['code'].' | '.$task['name'].' | Due: '.$task['due_date'].' | '.$task['frequency'];
+            }
+            $message="Preventive Maintenance Reminder\n\nReminder type: ".$stageLabel."\n\n".implode("\n",$lines)."\n\nGenerated: ".date('d/m/Y H:i:s').' IST';
+            $result=sendBrevoTransactionalEmail($email,(string)($user['name']??''),$subject,$message);
+            if ($result['ok']) {
+                $sent++;
+                foreach ($undelivered as $taskKey=>$task) {
+                    $deliveryKey=$today.'|'.strtolower($email).'|'.$taskKey;
+                    $data['email_delivery'][$deliveryKey]=[
+                        'timestamp'=>date('c'),'status'=>'sent','stage_days_before'=>(int)$stage,
+                        'equipment_id'=>$task['equipment_id'],'week'=>$task['week'],'due_date'=>$task['due_date']
+                    ];
+                }
+            } else {
+                $failed++;
+                error_log('PM Brevo API delivery failed for '.$email.': '.$result['message']);
+            }
+        }
+    }
+    return ['sent'=>$sent,'failed'=>$failed,'due'=>$dueCount];
 }
 
 /** Send a standalone Brevo API test message to the currently logged-in administrator. */
 function sendBrevoTestEmail(string $recipient, string $recipientName='Administrator'): array {
-    $message="This is a test email from the PM Scheduling System.\n\nIf you received this message, the Brevo API configuration is working.\n\nSent: ".date('d/m/Y H:i:s').' PHT';
+    $message="This is a test email from the PM Scheduling System.\n\nIf you received this message, the Brevo API configuration is working.\n\nSent: ".date('d/m/Y H:i:s').' IST';
     $result=sendBrevoTransactionalEmail($recipient,$recipientName,'PM Scheduling System - Brevo API Test',$message);
     if (!$result['ok']) error_log('PM Brevo API test failed: '.$result['message']);
     return $result;
@@ -720,6 +768,20 @@ function saveEnrollmentPhoto(string $field='photo'): array {
     $filename=bin2hex(random_bytes(16)).'.'.$extensions[$mime]; $target=USER_PHOTO_DIR.'/'.$filename;
     if (!move_uploaded_file((string)$file['tmp_name'],$target)) return ['', 'The personnel photo could not be saved.'];
     return ['pm_user_photos/'.$filename, ''];
+}
+
+
+// Render runs this file in CLI mode from its daily cron task. It uses the same
+// persistent JSON data file and Brevo API configuration as the web service.
+if (PHP_SAPI === 'cli' && getenv('PM_RUN_REMINDERS') === '1') {
+    $cronData=loadData();
+    $cronResult=sendDueEmailNotifications($cronData,false);
+    if ($cronResult['sent']>0 || $cronResult['failed']>0) {
+        $cronData['audit_logs'][]=['timestamp'=>date('c'),'user_id'=>null,'employee_no'=>'SYSTEM','name'=>'System','action'=>'SCHEDULED_PM_REMINDERS','details'=>'Items: '.$cronResult['due'].', emails accepted: '.$cronResult['sent'].', failed: '.$cronResult['failed'].'.'];
+    }
+    saveData($cronData);
+    echo 'PM reminder run ('.date('c').'): items='.$cronResult['due'].', emails_accepted='.$cronResult['sent'].', failed='.$cronResult['failed'].PHP_EOL;
+    exit(($cronResult['failed']??0)>0 ? 1 : 0);
 }
 
 $data = loadData();
@@ -1328,10 +1390,6 @@ for ($calendarWeek=1;$calendarWeek<=52;$calendarWeek++) {
     if (!$calendarQuarters || $calendarQuarters[count($calendarQuarters)-1]['key']!==$quarterKey) $calendarQuarters[]=['key'=>$quarterKey,'label'=>['1st QUARTER','2nd QUARTER','3rd QUARTER','4th QUARTER'][$quarterNumber-1],'span'=>1];
     else $calendarQuarters[count($calendarQuarters)-1]['span']++;
 }
-if ($_SERVER['REQUEST_METHOD']==='GET' && $currentUser) {
-    $emailResult=sendDueEmailNotifications($data,false);
-    if (($emailResult['sent']+$emailResult['failed'])>0) { auditAction($data,null,'AUTOMATIC_DUE_EMAIL','Due items: '.$emailResult['due'].', sent: '.$emailResult['sent'].', failed: '.$emailResult['failed'].'.'); saveData($data); }
-}
 $flash=$_SESSION['flash']??''; unset($_SESSION['flash']);
 ?>
 <?php
@@ -1435,10 +1493,10 @@ table{border-collapse:separate;border-spacing:0;min-width:2400px;width:100%;font
  <?php foreach($recordLogs as $recordNo=>$log):$checklist=is_array($log['checklist']??null)?$log['checklist']:[];$sheetId='recordSheet'.$recordNo;?>
   <article class="record-sheet" id="<?=e($sheetId)?>" style="border:1px solid #dfd2d3;border-radius:9px;padding:16px;margin:14px 0;background:#fff">
    <div class="toolbar record-actions"><div><h3 style="margin:0 0 5px"><?=e($recordEquipment['code'])?> — PM Completion Log Sheet</h3><span>WW<?=str_pad((string)($log['week']??''),2,'0',STR_PAD_LEFT)?> · <?=e(frequencyName((string)($log['frequency']??'')))?></span></div><button type="button" class="btn" style="margin-left:auto" onclick='openCallback(<?=json_encode(['record_index'=>(int)$log['_record_index'],'equipment_id'=>(int)$recordEquipment['id'],'equipment_code'=>$recordEquipment['code'],'equipment_name'=>$recordEquipment['name'],'week'=>(int)($log['week']??0),'frequency'=>(string)($log['frequency']??''),'checklist'=>$checklist,'last_callback_action'=>(string)($log['last_callback_action']??'')],JSON_HEX_APOS|JSON_HEX_QUOT)?>)'>Callback</button><button type="button" class="btn secondary" onclick="printRecord('<?=e($sheetId)?>')">Export PDF</button></div>
-   <div class="record-meta"><div><b>Machine</b><br><?=e($recordEquipment['name'])?></div><div><b>Equipment ID</b><br><?=e($recordEquipment['code'])?></div><div><b>Completion Date</b><br><?=e(!empty($log['completed_on'])?(new DateTimeImmutable($log['completed_on']))->format('d/m/Y'):'—')?></div><div><b>Frequency</b><br><?=e(frequencyCode((string)($log['frequency']??'')).' – '.frequencyName((string)($log['frequency']??'')))?></div><div><b>Completed By</b><br><?=e((string)($log['technician']??'—'))?></div><div><b>Recorded (PHT)</b><br><?=e(!empty($log['created_at'])?date('d/m/Y H:i:s',strtotime($log['created_at'])):'—')?></div><div><b>Reference Document #</b><br>FF ASM 10</div><div><b>Overall Remarks</b><br><?=e((string)($log['remarks']??'—'))?></div></div>
+   <div class="record-meta"><div><b>Machine</b><br><?=e($recordEquipment['name'])?></div><div><b>Equipment ID</b><br><?=e($recordEquipment['code'])?></div><div><b>Completion Date</b><br><?=e(!empty($log['completed_on'])?(new DateTimeImmutable($log['completed_on']))->format('d/m/Y'):'—')?></div><div><b>Frequency</b><br><?=e(frequencyCode((string)($log['frequency']??'')).' – '.frequencyName((string)($log['frequency']??'')))?></div><div><b>Completed By</b><br><?=e((string)($log['technician']??'—'))?></div><div><b>Recorded (IST)</b><br><?=e(!empty($log['created_at'])?date('d/m/Y H:i:s',strtotime($log['created_at'])):'—')?></div><div><b>Reference Document #</b><br>FF ASM 10</div><div><b>Overall Remarks</b><br><?=e((string)($log['remarks']??'—'))?></div></div>
    <?php if($checklist):?><h4>Completed Checklist</h4><div class="table-wrap" style="max-height:none"><table class="due-table record-checklist" style="min-width:650px"><thead><tr><th>No.</th><th>Check Item</th><th>Result</th><th>Remarks</th></tr></thead><tbody><?php foreach($checklist as $check):?><tr><td><?=e((string)($check['no']??''))?></td><td><b><?=e((string)($check['item']??''))?></b></td><td><span class="badge <?=($check['result']??'')==='NG'?'status-due':'status-done'?>"><?=e((string)($check['result']??''))?></span></td><td style="white-space:normal;min-width:220px"><?=e((string)($check['remarks']??''))?></td></tr><?php endforeach;?></tbody></table></div>
    <?php else:?><p><i>This completion was recorded without an equipment checklist.</i></p><?php endif;?>
-   <?php $callbackHistory=is_array($log['callback_history']??null)?$log['callback_history']:[];if($callbackHistory):?><h4>Callback History</h4><div class="table-wrap" style="max-height:none"><table class="due-table" style="min-width:700px"><thead><tr><th>Callback</th><th>Date and Time (PHT)</th><th>Updated By</th><th>Action Performed / Remarks</th></tr></thead><tbody><?php foreach($callbackHistory as $callback):?><tr><td>#<?=e((string)($callback['callback_no']??''))?></td><td><?=e(!empty($callback['updated_at'])?date('d/m/Y H:i:s',strtotime($callback['updated_at'])):'—')?></td><td><?=e((string)($callback['updated_by']??'—'))?></td><td style="white-space:normal;min-width:300px"><?=e((string)($callback['action_remarks']??'—'))?></td></tr><?php endforeach;?></tbody></table></div><?php endif;?>
+   <?php $callbackHistory=is_array($log['callback_history']??null)?$log['callback_history']:[];if($callbackHistory):?><h4>Callback History</h4><div class="table-wrap" style="max-height:none"><table class="due-table" style="min-width:700px"><thead><tr><th>Callback</th><th>Date and Time (IST)</th><th>Updated By</th><th>Action Performed / Remarks</th></tr></thead><tbody><?php foreach($callbackHistory as $callback):?><tr><td>#<?=e((string)($callback['callback_no']??''))?></td><td><?=e(!empty($callback['updated_at'])?date('d/m/Y H:i:s',strtotime($callback['updated_at'])):'—')?></td><td><?=e((string)($callback['updated_by']??'—'))?></td><td style="white-space:normal;min-width:300px"><?=e((string)($callback['action_remarks']??'—'))?></td></tr><?php endforeach;?></tbody></table></div><?php endif;?>
   </article>
  <?php endforeach;?></div><?php endif;?>
 </section>
@@ -1478,7 +1536,7 @@ table{border-collapse:separate;border-spacing:0;min-width:2400px;width:100%;font
  </svg></div>
 </section>
 <section class="panel" style="margin-top:16px"><h3 style="margin-top:0">Overdue PM Details</h3><div class="table-wrap" style="max-height:420px"><table class="due-table" style="min-width:850px"><thead><tr><th>No.</th><th>Machine</th><th>Equipment ID</th><th>Work Week</th><th>Due Date</th><th>Frequency</th></tr></thead><tbody><?php if(!$kpiOverdueItems):?><tr><td colspan="6">No overdue PM found for this frequency.</td></tr><?php endif;?><?php foreach($kpiOverdueItems as $i=>$item):?><tr><td><?=$i+1?></td><td style="text-align:left;white-space:normal"><?=e($item['name'])?></td><td><?=e($item['code'])?></td><td>WW<?=str_pad((string)$item['week'],2,'0',STR_PAD_LEFT)?></td><td><?=e(date('d/m/Y',strtotime($item['due_date'])))?></td><td><span class="badge f-<?=e($item['frequency'])?>"><?=e($item['frequency'].' – '.frequencyName($item['frequency']))?></span></td></tr><?php endforeach;?></tbody></table></div></section>
-<section class="panel" style="margin-top:16px"><h3 style="margin-top:0">Callback Details</h3><div class="table-wrap" style="max-height:420px"><table class="due-table" style="min-width:1150px"><thead><tr><th>No.</th><th>Machine</th><th>Equipment ID</th><th>Work Week</th><th>Frequency</th><th>Callback</th><th>Date &amp; Time (PHT)</th><th>Updated By</th><th>Action / Remarks</th></tr></thead><tbody><?php if(!$kpiCallbackItems):?><tr><td colspan="9">No callback found for this frequency.</td></tr><?php endif;?><?php foreach($kpiCallbackItems as $i=>$item):?><tr><td><?=$i+1?></td><td style="text-align:left;white-space:normal"><?=e($item['name'])?></td><td><?=e($item['code'])?></td><td>WW<?=str_pad((string)$item['week'],2,'0',STR_PAD_LEFT)?></td><td><span class="badge f-<?=e($item['frequency'])?>"><?=e($item['frequency'].' – '.frequencyName($item['frequency']))?></span></td><td>#<?=e((string)$item['callback_no'])?></td><td><?=e($item['updated_at']!==''?date('d/m/Y H:i:s',strtotime($item['updated_at'])):'—')?></td><td><?=e($item['updated_by']?:'—')?></td><td style="text-align:left;white-space:normal;min-width:280px"><?=e($item['remarks']?:'—')?></td></tr><?php endforeach;?></tbody></table></div></section>
+<section class="panel" style="margin-top:16px"><h3 style="margin-top:0">Callback Details</h3><div class="table-wrap" style="max-height:420px"><table class="due-table" style="min-width:1150px"><thead><tr><th>No.</th><th>Machine</th><th>Equipment ID</th><th>Work Week</th><th>Frequency</th><th>Callback</th><th>Date &amp; Time (IST)</th><th>Updated By</th><th>Action / Remarks</th></tr></thead><tbody><?php if(!$kpiCallbackItems):?><tr><td colspan="9">No callback found for this frequency.</td></tr><?php endif;?><?php foreach($kpiCallbackItems as $i=>$item):?><tr><td><?=$i+1?></td><td style="text-align:left;white-space:normal"><?=e($item['name'])?></td><td><?=e($item['code'])?></td><td>WW<?=str_pad((string)$item['week'],2,'0',STR_PAD_LEFT)?></td><td><span class="badge f-<?=e($item['frequency'])?>"><?=e($item['frequency'].' – '.frequencyName($item['frequency']))?></span></td><td>#<?=e((string)$item['callback_no'])?></td><td><?=e($item['updated_at']!==''?date('d/m/Y H:i:s',strtotime($item['updated_at'])):'—')?></td><td><?=e($item['updated_by']?:'—')?></td><td style="text-align:left;white-space:normal;min-width:280px"><?=e($item['remarks']?:'—')?></td></tr><?php endforeach;?></tbody></table></div></section>
 <?php elseif($view==='profile'):?>
 <section class="panel"><h2>My Profile</h2><div style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap"><?php if(!empty($currentUser['photo'])):?><img class="approval-photo" style="width:120px;height:120px" src="<?=e($currentUser['photo'])?>" alt="Profile photo"><?php endif;?><form method="post" enctype="multipart/form-data" class="grid" style="max-width:720px;flex:1"><input type="hidden" name="action" value="update_profile"><label class="field">Name<input value="<?=e($currentUser['name'])?>" readonly></label><label class="field">Employee No.<input value="<?=e($currentUser['employee_no'])?>" readonly></label><label class="field">Designation<input value="<?=e($currentUser['designation'])?>" readonly></label><label class="field">Email Address<input type="email" name="email" value="<?=e((string)($currentUser['email']??''))?>" required></label><label class="field full"><span><input type="checkbox" name="email_notifications" value="1" <?=!empty($currentUser['email_notifications'])?'checked':''?>> Receive PM due email notifications</span></label><label class="field full">Upload New Profile Photo<input type="file" name="profile_photo" accept="image/jpeg,image/png,image/webp"><small>Leave blank to keep the current photo. Maximum 2 MB.</small></label><span></span><button>Update Profile</button></form></div></section>
 <section class="panel" style="margin-top:16px"><h2>Change My Password</h2><form method="post" class="grid" style="max-width:720px"><input type="hidden" name="action" value="change_own_password"><label class="field full">Current Password<input type="password" name="current_password" required></label><label class="field">New Password<input type="password" name="new_password" minlength="8" required></label><label class="field">Confirm New Password<input type="password" name="confirm_password" minlength="8" required></label><span></span><button>Change Password</button></form></section>
@@ -1488,7 +1546,7 @@ table{border-collapse:separate;border-spacing:0;min-width:2400px;width:100%;font
 <?php foreach($data['users'] as $user):if((int)$user['id']===(int)$currentUser['id'])continue;?><tr><td><?php if(!empty($user['photo'])):?><img class="approval-photo" src="<?=e($user['photo'])?>" alt="<?=e($user['name'])?> photo"><?php else:?>No photo<?php endif;?></td><td><?=e($user['name'])?></td><td><?=e($user['employee_no'])?></td><td><?=e((string)($user['email']??''))?></td><td><?=!empty($user['email_notifications'])?'Yes':'No'?></td><td><?=e($user['designation'])?></td><td><?=e(date('d/m/Y H:i',strtotime($user['created_at'])))?></td><td><span class="badge <?=($user['status']==='approved'?'status-done':($user['status']==='pending'?'f-H':'status-due'))?>"><?=e(ucfirst($user['status']))?></span></td><td><?php if($user['status']==='pending'):?><div class="actions"><form method="post"><input type="hidden" name="action" value="approve_user"><input type="hidden" name="user_id" value="<?=$user['id']?>"><button>Approve</button></form><form method="post"><input type="hidden" name="action" value="reject_user"><input type="hidden" name="user_id" value="<?=$user['id']?>"><button class="btn danger">Reject</button></form></div><?php elseif($user['status']==='approved'):?><form method="post" class="actions" onsubmit="return confirm('Reset this user password?')"><input type="hidden" name="action" value="reset_user_password"><input type="hidden" name="user_id" value="<?=$user['id']?>"><input type="password" name="new_password" minlength="8" placeholder="New password" required><button>Reset Password</button></form><?php else:?>—<?php endif;?></td></tr><?php endforeach;?>
 </tbody></table></div></section>
 <section class="panel" style="margin-top:16px"><h2>Administrator Password</h2><form method="post" class="grid" style="max-width:720px"><input type="hidden" name="action" value="change_admin_password"><label class="field">Current Password<input type="password" name="current_password" required></label><span></span><label class="field">New Password<input type="password" name="new_password" minlength="8" required></label><label class="field">Confirm New Password<input type="password" name="confirm_password" minlength="8" required></label><span></span><button>Change Password</button></form></section>
-<section class="panel" style="margin-top:16px"><h2>Latest Transaction Audit Log</h2><div class="table-wrap" style="max-height:420px"><table class="due-table"><thead><tr><th>Date & Time (PHT)</th><th>Employee</th><th>Name</th><th>Action</th><th>Details</th></tr></thead><tbody><?php foreach(array_slice(array_reverse($data['audit_logs']),0,50) as $audit):?><tr><td><?=e(date('d/m/Y H:i:s',strtotime($audit['timestamp'])))?></td><td><?=e((string)$audit['employee_no'])?></td><td><?=e((string)$audit['name'])?></td><td><?=e((string)$audit['action'])?></td><td><?=e((string)$audit['details'])?></td></tr><?php endforeach;?></tbody></table></div></section>
+<section class="panel" style="margin-top:16px"><h2>Latest Transaction Audit Log</h2><div class="table-wrap" style="max-height:420px"><table class="due-table"><thead><tr><th>Date & Time (IST)</th><th>Employee</th><th>Name</th><th>Action</th><th>Details</th></tr></thead><tbody><?php foreach(array_slice(array_reverse($data['audit_logs']),0,50) as $audit):?><tr><td><?=e(date('d/m/Y H:i:s',strtotime($audit['timestamp'])))?></td><td><?=e((string)$audit['employee_no'])?></td><td><?=e((string)$audit['name'])?></td><td><?=e((string)$audit['action'])?></td><td><?=e((string)$audit['details'])?></td></tr><?php endforeach;?></tbody></table></div></section>
 <?php endif;?></main>
 
 <?php if(($currentUser['role']??'')==='admin'):?><div class="modal" id="auxModal"><div class="modal-box" style="width:min(900px,96vw);max-height:92vh;overflow:auto"><h2 id="auxTitle">Add Equipment / Aux Information</h2><form method="post" class="grid"><input type="hidden" name="action" value="save_aux_information"><input type="hidden" name="id" id="auxId" value="0"><?php foreach($data['aux_headers'] as $fieldIndex=>$header):?><label class="field <?=in_array($fieldIndex,[1,3,8],true)?'full':''?>"><?=e((string)$header)?><input name="values[<?=$fieldIndex?>]" id="auxField<?=$fieldIndex?>" <?=in_array($fieldIndex,[0,4],true)?'autocomplete="off"':''?>></label><?php endforeach;?><button type="button" class="btn secondary" onclick="closeModal('auxModal')">Cancel</button><button>Save Information</button></form></div></div><?php endif;?>

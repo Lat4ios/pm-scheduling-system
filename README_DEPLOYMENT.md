@@ -89,3 +89,30 @@ Set these Render environment variables on the web service:
 After deploying, sign in as Admin and open the Admin page. Use **Send Brevo API Test Email to Admin** to send a test message to the email address saved in the Admin profile. This test does not depend on PM items being due. If it fails, the application displays a diagnostic message and writes details to the Render service logs. Do not share API keys in screenshots or chat.
 
 Automatic PM due-list emails are separate from the Brevo API test. They are sent only when an open PM item is due within two days or overdue, and only to approved employees with a valid email address and the email-notification preference enabled.
+
+
+## Automated PM reminder emails (Ahmedabad time)
+
+The container runs a daily cron task at **08:00 Asia/Kolkata (Ahmedabad, India)**. It runs independently of user logins and checks the persistent PM schedule data file. It sends separate transactional email reminders through the Brevo HTTPS API:
+
+- 7 calendar days before each incomplete PM task's due date
+- 2 calendar days before each incomplete PM task's due date
+- On the PM task's due date
+
+Only approved users with email notifications enabled and a valid email address receive reminders. Successful deliveries are recorded per recipient, equipment item, due date, and reminder stage to prevent duplicate sends. Failed API attempts are logged and are not marked as delivered, allowing a later manual rerun; the daily task itself checks the exact reminder day.
+
+### Required Render environment variables
+
+Set these on the existing Render web service under **Environment**:
+
+- `PM_DATA_DIR=/var/data`
+- `PM_TIMEZONE=Asia/Kolkata`
+- `BREVO_API_KEY` = the regular Brevo API key (not an SMTP key or MCP key)
+- `BREVO_FROM_EMAIL` = a verified sender address in Brevo
+- `BREVO_FROM_NAME=PM Scheduling System`
+
+Keep the existing persistent disk mounted at `/var/data`. Do not create a separate Render Cron Job: the daily cron daemon is included in the same web-service container so it can access the same mounted persistent disk. The schedule is **08:00 India Standard Time (UTC+05:30)** daily.
+
+### Verify the scheduler
+
+After deployment, inspect the Render service logs for cron output. The task appends its run results to `/var/data/pm-reminders.log`. The cron task starts with the web container and does not require an administrator to log in. A running web service is required for the scheduled task to execute.

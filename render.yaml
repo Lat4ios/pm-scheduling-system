@@ -11,7 +11,7 @@ services:
       - key: PM_DATA_DIR
         value: /var/data
       - key: PM_TIMEZONE
-        value: Asia/Manila
+        value: Asia/Kolkata
       - key: PM_ADMIN_INITIAL_PASSWORD
         sync: false
       - key: BREVO_API_KEY

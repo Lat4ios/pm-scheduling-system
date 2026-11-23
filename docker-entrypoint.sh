@@ -59,5 +59,41 @@ if [ ! -f "$DATA_DIR/.admin-password-initialized" ]; then
   touch "$DATA_DIR/.admin-password-initialized"
 fi
 
+# Configure the container clock for Ahmedabad, India (Asia/Kolkata).
+TIMEZONE="${PM_TIMEZONE:-Asia/Kolkata}"
+if [ -f "/usr/share/zoneinfo/$TIMEZONE" ]; then
+  ln -snf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
+  printf '%s\n' "$TIMEZONE" > /etc/timezone
+else
+  echo "ERROR: Unknown PM_TIMEZONE: $TIMEZONE" >&2
+  exit 1
+fi
+
+# Cron does not inherit the web process environment. Safely export only the
+# settings needed by the reminder task into a root-only runtime file.
+/usr/bin/bash -c '
+  set -eu
+  output=/usr/local/bin/pm-cron-env.sh
+  printf "%s\n" "#!/usr/bin/env bash" > "$output"
+  for name in PM_DATA_DIR PM_TIMEZONE BREVO_API_KEY BREVO_FROM_EMAIL BREVO_FROM_NAME; do
+    printf "export %s=%q\n" "$name" "${!name-}" >> "$output"
+  done
+  chmod 700 "$output"
+'
+
+cat > /usr/local/bin/run-pm-reminders <<'RUNNER'
+#!/bin/bash
+set -euo pipefail
+source /usr/local/bin/pm-cron-env.sh
+export PM_RUN_REMINDERS=1
+exec php /var/www/html/index.php
+RUNNER
+chmod 700 /usr/local/bin/run-pm-reminders
+
+# Run every day at 08:00 Ahmedabad time. The container timezone is set above.
+printf '%s\n' '0 8 * * * root /usr/local/bin/run-pm-reminders >> /var/data/pm-reminders.log 2>&1' > /etc/cron.d/pm-reminders
+chmod 644 /etc/cron.d/pm-reminders
+cron
+
 chown -R www-data:www-data "$DATA_DIR"
 exec "$@"
