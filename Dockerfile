@@ -1,16 +1,7 @@
-
 FROM php:8.4-apache
 
-# Install Composer
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
-# Install ZIP extension and unzip for Composer
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends libzip-dev unzip \
-    && docker-php-ext-install zip \
-    && rm -rf /var/lib/apt/lists/*
-
-# Configure Apache
 RUN a2enmod headers expires \
     && sed -i 's/Listen 80/Listen 10000/' /etc/apache2/ports.conf \
     && sed -i 's/<VirtualHost \*:80>/<VirtualHost *:10000>/' /etc/apache2/sites-available/000-default.conf \
@@ -19,32 +10,19 @@ RUN a2enmod headers expires \
     && a2enconf pmsched-security
 
 WORKDIR /var/www/html
-
-# Install PHP dependencies
 COPY composer.json /var/www/html/composer.json
-
 RUN composer install --no-dev --no-interaction --prefer-dist --optimize-autoloader \
     && composer clear-cache
-
-# Copy application
 COPY PMsched.php /var/www/html/index.php
-
-# Seed data outside Apache's public document root
+# Seed data is stored outside Apache's public document root.
 RUN mkdir -p /opt/pmsched-seed /var/data
-
 COPY pm_schedule_data.json /opt/pmsched-seed/pm_schedule_data.json
 COPY pm_user_photos/ /opt/pmsched-seed/pm_user_photos/
-
-# Configure persistent storage entrypoint
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
     && chown -R www-data:www-data /var/www/html /var/data
 
 ENV PORT=10000
-
 EXPOSE 10000
-
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-
 CMD ["apache2-foreground"]

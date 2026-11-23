@@ -79,3 +79,20 @@ docker run --rm -p 10000:10000 \
 ```
 
 Open http://localhost:10000.
+
+## Email configuration and testing
+
+Set these Render environment variables on the web service:
+
+- `SMTP_HOST=smtp-relay.brevo.com`
+- `SMTP_PORT=587`
+- `SMTP_ENCRYPTION=tls`
+- `SMTP_USERNAME` = the SMTP login shown in Brevo
+- `SMTP_PASSWORD` = the SMTP key generated in Brevo (not the API key)
+- `SMTP_FROM_EMAIL` = a sender address verified in Brevo
+- `SMTP_FROM_NAME=PM Scheduling System`
+- `PM_TIMEZONE=Asia/Manila`
+
+After deploying, sign in as Admin and open the Admin page. Use **Send SMTP Test Email to Admin** to send a test message to the email address saved in the Admin profile. This test does not depend on PM items being due. If it fails, the application displays a diagnostic message and writes the detailed error to the Render service logs. Do not share SMTP passwords or keys in screenshots or chat.
+
+Automatic PM due-list emails are separate from the SMTP test. They are sent only when an open PM item is due within two days or overdue, and only to approved employees with a valid email address and the email-notification preference enabled.

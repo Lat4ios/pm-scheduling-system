@@ -19,8 +19,8 @@ session_set_cookie_params([
     'samesite' => 'Lax',
 ]);
 session_start();
-// All system timestamps use the configured company timezone (defaults to India Standard Time).
-date_default_timezone_set(getenv('PM_TIMEZONE') ?: 'Asia/Kolkata');
+// All system timestamps use the configured company timezone (Philippine Time by default).
+date_default_timezone_set(getenv('PM_TIMEZONE') ?: 'Asia/Manila');
 
 // On Render, keep all mutable data on the attached persistent disk.
 $dataDirectory = rtrim(getenv('PM_DATA_DIR') ?: __DIR__, DIRECTORY_SEPARATOR);
@@ -499,7 +499,7 @@ function sendDueEmailNotifications(array &$data, bool $force=false): array {
     }
     if (!$due) return ['sent'=>0,'failed'=>0,'due'=>0];
     $subject='PM Advance Alarm / Due Notification - WW'.str_pad((string)$workWeek,2,'0',STR_PAD_LEFT);
-    $message="Preventive Maintenance alarms due within 2 days or overdue for WW".str_pad((string)$workWeek,2,'0',STR_PAD_LEFT)."\n\n".implode("\n",$due)."\n\nGenerated: ".date('d/m/Y H:i:s').' IST';
+    $message="Preventive Maintenance alarms due within 2 days or overdue for WW".str_pad((string)$workWeek,2,'0',STR_PAD_LEFT)."\n\n".implode("\n",$due)."\n\nGenerated: ".date('d/m/Y H:i:s').' PHT';
     $sent=0; $failed=0;
     if (!isset($data['email_delivery']) || !is_array($data['email_delivery'])) $data['email_delivery']=[];
     $smtpHost=trim((string)(getenv('SMTP_HOST') ?: 'smtp-relay.brevo.com'));
@@ -547,6 +547,60 @@ function sendDueEmailNotifications(array &$data, bool $force=false): array {
         $data['email_delivery'][$deliveryKey]=['timestamp'=>date('c'),'status'=>$ok?'sent':'failed','due_count'=>count($due)];
     }
     return ['sent'=>$sent,'failed'=>$failed,'due'=>count($due)];
+}
+
+/** Send a standalone SMTP test message to the currently logged-in administrator. */
+function sendSmtpTestEmail(string $recipient, string $recipientName='Administrator'): array {
+    if (!filter_var($recipient, FILTER_VALIDATE_EMAIL)) {
+        return ['ok'=>false, 'message'=>'Add a valid email address to your Admin profile first.'];
+    }
+    if (!class_exists(\PHPMailer\PHPMailer\PHPMailer::class)) {
+        error_log('PM email test failed: PHPMailer autoloader/class is unavailable.');
+        return ['ok'=>false, 'message'=>'PHPMailer is not installed. Check the Composer install step in the Render build logs.'];
+    }
+
+    $host=trim((string)(getenv('SMTP_HOST') ?: 'smtp-relay.brevo.com'));
+    $port=(int)(getenv('SMTP_PORT') ?: 587);
+    $username=trim((string)getenv('SMTP_USERNAME'));
+    $password=(string)getenv('SMTP_PASSWORD');
+    $encryption=strtolower(trim((string)(getenv('SMTP_ENCRYPTION') ?: 'tls')));
+    $fromEmail=trim((string)getenv('SMTP_FROM_EMAIL'));
+    $fromName=trim((string)(getenv('SMTP_FROM_NAME') ?: 'PM Scheduling System'));
+
+    $missing=[];
+    if ($host==='') $missing[]='SMTP_HOST';
+    if ($port<1) $missing[]='SMTP_PORT';
+    if ($username==='') $missing[]='SMTP_USERNAME';
+    if ($password==='') $missing[]='SMTP_PASSWORD';
+    if (!filter_var($fromEmail,FILTER_VALIDATE_EMAIL)) $missing[]='SMTP_FROM_EMAIL (must be a valid verified sender address)';
+    if (!in_array($encryption,['tls','ssl'],true)) $missing[]='SMTP_ENCRYPTION (use tls or ssl)';
+    if ($missing) return ['ok'=>false, 'message'=>'Missing or invalid Render environment setting(s): '.implode(', ',$missing).'.'];
+
+    try {
+        $mailer=new \PHPMailer\PHPMailer\PHPMailer(true);
+        $mailer->isSMTP();
+        $mailer->Host=$host;
+        $mailer->SMTPAuth=true;
+        $mailer->Username=$username;
+        $mailer->Password=$password;
+        $mailer->Port=$port;
+        $mailer->SMTPSecure=$encryption==='ssl'
+            ? \PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_SMTPS
+            : \PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_STARTTLS;
+        $mailer->Timeout=20;
+        $mailer->CharSet='UTF-8';
+        $mailer->setFrom($fromEmail,$fromName);
+        $mailer->addAddress($recipient,$recipientName);
+        $mailer->isHTML(false);
+        $mailer->Subject='PM Scheduling System - SMTP Test';
+        $mailer->Body="This is a test email from the PM Scheduling System.\n\nIf you received this message, the SMTP configuration is working.\n\nSent: ".date('d/m/Y H:i:s').' PHT';
+        $mailer->send();
+        return ['ok'=>true, 'message'=>'Test email accepted by the SMTP server for '.$recipient.'. Check the inbox and spam folder.'];
+    } catch (\Throwable $mailError) {
+        // PHPMailer error text is useful for diagnostics; never log the SMTP password.
+        error_log('PM SMTP test failed: '.$mailError->getMessage());
+        return ['ok'=>false, 'message'=>'SMTP test failed: '.$mailError->getMessage()];
+    }
 }
 
 function auxInformationHeaders(): array {
@@ -951,8 +1005,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($currentUser) { auditAction($data,$currentUser,'LOGOUT','User logged out.'); saveData($data); }
         session_destroy(); header('Location: '.$_SERVER['PHP_SELF']); exit;
     }
-    $loginActions=['complete_pm','callback_pm','set_frequency','save_equipment','delete_equipment','save_aux_information','delete_aux_information','create_checklist_template','delete_checklist_template','save_checklist_item','delete_checklist_item','reset_data','approve_user','reject_user','change_admin_password','update_profile','change_own_password','reset_user_password','send_due_email'];
-    $adminActions=['set_frequency','save_equipment','delete_equipment','save_aux_information','delete_aux_information','create_checklist_template','delete_checklist_template','save_checklist_item','delete_checklist_item','reset_data','approve_user','reject_user','change_admin_password','reset_user_password','send_due_email'];
+    $loginActions=['complete_pm','callback_pm','set_frequency','save_equipment','delete_equipment','save_aux_information','delete_aux_information','create_checklist_template','delete_checklist_template','save_checklist_item','delete_checklist_item','reset_data','approve_user','reject_user','change_admin_password','update_profile','change_own_password','reset_user_password','send_due_email','send_test_email'];
+    $adminActions=['set_frequency','save_equipment','delete_equipment','save_aux_information','delete_aux_information','create_checklist_template','delete_checklist_template','save_checklist_item','delete_checklist_item','reset_data','approve_user','reject_user','change_admin_password','reset_user_password','send_due_email','send_test_email'];
     if (in_array($action,$loginActions,true) && !$currentUser) {
         if ($action==='set_frequency') { http_response_code(401); header('Content-Type: application/json'); echo json_encode(['ok'=>false,'error'=>'Login required']); exit; }
         setFlash('Please log in with an approved account to perform this transaction.'); header('Location: '.$_SERVER['PHP_SELF']); exit;
@@ -983,6 +1037,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $targetId=(int)($_POST['user_id']??0); $newPassword=(string)($_POST['new_password']??'');
         if (strlen($newPassword)<8) setFlash('Reset password must contain at least 8 characters.');
         else { foreach ($data['users'] as &$user) if ((int)$user['id']===$targetId && ($user['status']??'')==='approved') { $user['password_hash']=password_hash($newPassword,PASSWORD_DEFAULT); auditAction($data,$currentUser,'RESET_USER_PASSWORD','Password reset for '.$user['employee_no'].' - '.$user['name'].'.'); } unset($user); saveData($data); setFlash('User password reset successfully.'); }
+        header('Location: '.$_SERVER['PHP_SELF'].'?view=admin'); exit;
+    }
+    if ($action === 'send_test_email') {
+        $adminEmail=trim((string)($currentUser['email']??''));
+        $testResult=sendSmtpTestEmail($adminEmail,(string)($currentUser['name']??'Administrator'));
+        auditAction($data,$currentUser,'SEND_TEST_EMAIL',$testResult['ok']?'SMTP test accepted for '.$adminEmail:$testResult['message']);
+        saveData($data);
+        setFlash($testResult['message']);
         header('Location: '.$_SERVER['PHP_SELF'].'?view=admin'); exit;
     }
     if ($action === 'send_due_email') {
@@ -1392,10 +1454,10 @@ table{border-collapse:separate;border-spacing:0;min-width:2400px;width:100%;font
  <?php foreach($recordLogs as $recordNo=>$log):$checklist=is_array($log['checklist']??null)?$log['checklist']:[];$sheetId='recordSheet'.$recordNo;?>
   <article class="record-sheet" id="<?=e($sheetId)?>" style="border:1px solid #dfd2d3;border-radius:9px;padding:16px;margin:14px 0;background:#fff">
    <div class="toolbar record-actions"><div><h3 style="margin:0 0 5px"><?=e($recordEquipment['code'])?> — PM Completion Log Sheet</h3><span>WW<?=str_pad((string)($log['week']??''),2,'0',STR_PAD_LEFT)?> · <?=e(frequencyName((string)($log['frequency']??'')))?></span></div><button type="button" class="btn" style="margin-left:auto" onclick='openCallback(<?=json_encode(['record_index'=>(int)$log['_record_index'],'equipment_id'=>(int)$recordEquipment['id'],'equipment_code'=>$recordEquipment['code'],'equipment_name'=>$recordEquipment['name'],'week'=>(int)($log['week']??0),'frequency'=>(string)($log['frequency']??''),'checklist'=>$checklist,'last_callback_action'=>(string)($log['last_callback_action']??'')],JSON_HEX_APOS|JSON_HEX_QUOT)?>)'>Callback</button><button type="button" class="btn secondary" onclick="printRecord('<?=e($sheetId)?>')">Export PDF</button></div>
-   <div class="record-meta"><div><b>Machine</b><br><?=e($recordEquipment['name'])?></div><div><b>Equipment ID</b><br><?=e($recordEquipment['code'])?></div><div><b>Completion Date</b><br><?=e(!empty($log['completed_on'])?(new DateTimeImmutable($log['completed_on']))->format('d/m/Y'):'—')?></div><div><b>Frequency</b><br><?=e(frequencyCode((string)($log['frequency']??'')).' – '.frequencyName((string)($log['frequency']??'')))?></div><div><b>Completed By</b><br><?=e((string)($log['technician']??'—'))?></div><div><b>Recorded (IST)</b><br><?=e(!empty($log['created_at'])?date('d/m/Y H:i:s',strtotime($log['created_at'])):'—')?></div><div><b>Reference Document #</b><br>FF ASM 10</div><div><b>Overall Remarks</b><br><?=e((string)($log['remarks']??'—'))?></div></div>
+   <div class="record-meta"><div><b>Machine</b><br><?=e($recordEquipment['name'])?></div><div><b>Equipment ID</b><br><?=e($recordEquipment['code'])?></div><div><b>Completion Date</b><br><?=e(!empty($log['completed_on'])?(new DateTimeImmutable($log['completed_on']))->format('d/m/Y'):'—')?></div><div><b>Frequency</b><br><?=e(frequencyCode((string)($log['frequency']??'')).' – '.frequencyName((string)($log['frequency']??'')))?></div><div><b>Completed By</b><br><?=e((string)($log['technician']??'—'))?></div><div><b>Recorded (PHT)</b><br><?=e(!empty($log['created_at'])?date('d/m/Y H:i:s',strtotime($log['created_at'])):'—')?></div><div><b>Reference Document #</b><br>FF ASM 10</div><div><b>Overall Remarks</b><br><?=e((string)($log['remarks']??'—'))?></div></div>
    <?php if($checklist):?><h4>Completed Checklist</h4><div class="table-wrap" style="max-height:none"><table class="due-table record-checklist" style="min-width:650px"><thead><tr><th>No.</th><th>Check Item</th><th>Result</th><th>Remarks</th></tr></thead><tbody><?php foreach($checklist as $check):?><tr><td><?=e((string)($check['no']??''))?></td><td><b><?=e((string)($check['item']??''))?></b></td><td><span class="badge <?=($check['result']??'')==='NG'?'status-due':'status-done'?>"><?=e((string)($check['result']??''))?></span></td><td style="white-space:normal;min-width:220px"><?=e((string)($check['remarks']??''))?></td></tr><?php endforeach;?></tbody></table></div>
    <?php else:?><p><i>This completion was recorded without an equipment checklist.</i></p><?php endif;?>
-   <?php $callbackHistory=is_array($log['callback_history']??null)?$log['callback_history']:[];if($callbackHistory):?><h4>Callback History</h4><div class="table-wrap" style="max-height:none"><table class="due-table" style="min-width:700px"><thead><tr><th>Callback</th><th>Date and Time (IST)</th><th>Updated By</th><th>Action Performed / Remarks</th></tr></thead><tbody><?php foreach($callbackHistory as $callback):?><tr><td>#<?=e((string)($callback['callback_no']??''))?></td><td><?=e(!empty($callback['updated_at'])?date('d/m/Y H:i:s',strtotime($callback['updated_at'])):'—')?></td><td><?=e((string)($callback['updated_by']??'—'))?></td><td style="white-space:normal;min-width:300px"><?=e((string)($callback['action_remarks']??'—'))?></td></tr><?php endforeach;?></tbody></table></div><?php endif;?>
+   <?php $callbackHistory=is_array($log['callback_history']??null)?$log['callback_history']:[];if($callbackHistory):?><h4>Callback History</h4><div class="table-wrap" style="max-height:none"><table class="due-table" style="min-width:700px"><thead><tr><th>Callback</th><th>Date and Time (PHT)</th><th>Updated By</th><th>Action Performed / Remarks</th></tr></thead><tbody><?php foreach($callbackHistory as $callback):?><tr><td>#<?=e((string)($callback['callback_no']??''))?></td><td><?=e(!empty($callback['updated_at'])?date('d/m/Y H:i:s',strtotime($callback['updated_at'])):'—')?></td><td><?=e((string)($callback['updated_by']??'—'))?></td><td style="white-space:normal;min-width:300px"><?=e((string)($callback['action_remarks']??'—'))?></td></tr><?php endforeach;?></tbody></table></div><?php endif;?>
   </article>
  <?php endforeach;?></div><?php endif;?>
 </section>
@@ -1435,17 +1497,17 @@ table{border-collapse:separate;border-spacing:0;min-width:2400px;width:100%;font
  </svg></div>
 </section>
 <section class="panel" style="margin-top:16px"><h3 style="margin-top:0">Overdue PM Details</h3><div class="table-wrap" style="max-height:420px"><table class="due-table" style="min-width:850px"><thead><tr><th>No.</th><th>Machine</th><th>Equipment ID</th><th>Work Week</th><th>Due Date</th><th>Frequency</th></tr></thead><tbody><?php if(!$kpiOverdueItems):?><tr><td colspan="6">No overdue PM found for this frequency.</td></tr><?php endif;?><?php foreach($kpiOverdueItems as $i=>$item):?><tr><td><?=$i+1?></td><td style="text-align:left;white-space:normal"><?=e($item['name'])?></td><td><?=e($item['code'])?></td><td>WW<?=str_pad((string)$item['week'],2,'0',STR_PAD_LEFT)?></td><td><?=e(date('d/m/Y',strtotime($item['due_date'])))?></td><td><span class="badge f-<?=e($item['frequency'])?>"><?=e($item['frequency'].' – '.frequencyName($item['frequency']))?></span></td></tr><?php endforeach;?></tbody></table></div></section>
-<section class="panel" style="margin-top:16px"><h3 style="margin-top:0">Callback Details</h3><div class="table-wrap" style="max-height:420px"><table class="due-table" style="min-width:1150px"><thead><tr><th>No.</th><th>Machine</th><th>Equipment ID</th><th>Work Week</th><th>Frequency</th><th>Callback</th><th>Date &amp; Time (IST)</th><th>Updated By</th><th>Action / Remarks</th></tr></thead><tbody><?php if(!$kpiCallbackItems):?><tr><td colspan="9">No callback found for this frequency.</td></tr><?php endif;?><?php foreach($kpiCallbackItems as $i=>$item):?><tr><td><?=$i+1?></td><td style="text-align:left;white-space:normal"><?=e($item['name'])?></td><td><?=e($item['code'])?></td><td>WW<?=str_pad((string)$item['week'],2,'0',STR_PAD_LEFT)?></td><td><span class="badge f-<?=e($item['frequency'])?>"><?=e($item['frequency'].' – '.frequencyName($item['frequency']))?></span></td><td>#<?=e((string)$item['callback_no'])?></td><td><?=e($item['updated_at']!==''?date('d/m/Y H:i:s',strtotime($item['updated_at'])):'—')?></td><td><?=e($item['updated_by']?:'—')?></td><td style="text-align:left;white-space:normal;min-width:280px"><?=e($item['remarks']?:'—')?></td></tr><?php endforeach;?></tbody></table></div></section>
+<section class="panel" style="margin-top:16px"><h3 style="margin-top:0">Callback Details</h3><div class="table-wrap" style="max-height:420px"><table class="due-table" style="min-width:1150px"><thead><tr><th>No.</th><th>Machine</th><th>Equipment ID</th><th>Work Week</th><th>Frequency</th><th>Callback</th><th>Date &amp; Time (PHT)</th><th>Updated By</th><th>Action / Remarks</th></tr></thead><tbody><?php if(!$kpiCallbackItems):?><tr><td colspan="9">No callback found for this frequency.</td></tr><?php endif;?><?php foreach($kpiCallbackItems as $i=>$item):?><tr><td><?=$i+1?></td><td style="text-align:left;white-space:normal"><?=e($item['name'])?></td><td><?=e($item['code'])?></td><td>WW<?=str_pad((string)$item['week'],2,'0',STR_PAD_LEFT)?></td><td><span class="badge f-<?=e($item['frequency'])?>"><?=e($item['frequency'].' – '.frequencyName($item['frequency']))?></span></td><td>#<?=e((string)$item['callback_no'])?></td><td><?=e($item['updated_at']!==''?date('d/m/Y H:i:s',strtotime($item['updated_at'])):'—')?></td><td><?=e($item['updated_by']?:'—')?></td><td style="text-align:left;white-space:normal;min-width:280px"><?=e($item['remarks']?:'—')?></td></tr><?php endforeach;?></tbody></table></div></section>
 <?php elseif($view==='profile'):?>
 <section class="panel"><h2>My Profile</h2><div style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap"><?php if(!empty($currentUser['photo'])):?><img class="approval-photo" style="width:120px;height:120px" src="<?=e($currentUser['photo'])?>" alt="Profile photo"><?php endif;?><form method="post" enctype="multipart/form-data" class="grid" style="max-width:720px;flex:1"><input type="hidden" name="action" value="update_profile"><label class="field">Name<input value="<?=e($currentUser['name'])?>" readonly></label><label class="field">Employee No.<input value="<?=e($currentUser['employee_no'])?>" readonly></label><label class="field">Designation<input value="<?=e($currentUser['designation'])?>" readonly></label><label class="field">Email Address<input type="email" name="email" value="<?=e((string)($currentUser['email']??''))?>" required></label><label class="field full"><span><input type="checkbox" name="email_notifications" value="1" <?=!empty($currentUser['email_notifications'])?'checked':''?>> Receive PM due email notifications</span></label><label class="field full">Upload New Profile Photo<input type="file" name="profile_photo" accept="image/jpeg,image/png,image/webp"><small>Leave blank to keep the current photo. Maximum 2 MB.</small></label><span></span><button>Update Profile</button></form></div></section>
 <section class="panel" style="margin-top:16px"><h2>Change My Password</h2><form method="post" class="grid" style="max-width:720px"><input type="hidden" name="action" value="change_own_password"><label class="field full">Current Password<input type="password" name="current_password" required></label><label class="field">New Password<input type="password" name="new_password" minlength="8" required></label><label class="field">Confirm New Password<input type="password" name="confirm_password" minlength="8" required></label><span></span><button>Change Password</button></form></section>
 <?php else:?>
-<section class="panel"><h2>PM Due Email Notifications</h2><p>The system sends one daily WW due-list email to every approved user who enabled notifications. Render must have valid Brevo SMTP environment variables configured. Use the button below to send a test due-list notification when items are due.</p><form method="post"><input type="hidden" name="action" value="send_due_email"><button>Send Due Email Now</button></form></section>
+<section class="panel"><h2>PM Email Notifications</h2><p>Automatic due-list emails are sent to approved employees who have a valid email address and enabled notifications, when PM items are due within 2 days or overdue.</p><div style="display:flex;gap:12px;flex-wrap:wrap"><form method="post"><input type="hidden" name="action" value="send_test_email"><button class="btn secondary">Send SMTP Test Email to Admin</button></form><form method="post"><input type="hidden" name="action" value="send_due_email"><button>Send Due Email Now</button></form></div><small>SMTP test recipient: <?=e((string)($currentUser['email']??'No Admin email set — update My Profile first'))?>. The SMTP test works even when there are no due PM items.</small></section>
 <section class="panel" style="margin-top:16px"><h2>User Enrollment Approval and Accounts</h2><div class="table-wrap" style="max-height:none"><table class="due-table"><thead><tr><th>Photo</th><th>Name</th><th>Employee No.</th><th>Email</th><th>Notify</th><th>Designation</th><th>Requested</th><th>Status</th><th>Approval / Password Reset</th></tr></thead><tbody>
 <?php foreach($data['users'] as $user):if((int)$user['id']===(int)$currentUser['id'])continue;?><tr><td><?php if(!empty($user['photo'])):?><img class="approval-photo" src="<?=e($user['photo'])?>" alt="<?=e($user['name'])?> photo"><?php else:?>No photo<?php endif;?></td><td><?=e($user['name'])?></td><td><?=e($user['employee_no'])?></td><td><?=e((string)($user['email']??''))?></td><td><?=!empty($user['email_notifications'])?'Yes':'No'?></td><td><?=e($user['designation'])?></td><td><?=e(date('d/m/Y H:i',strtotime($user['created_at'])))?></td><td><span class="badge <?=($user['status']==='approved'?'status-done':($user['status']==='pending'?'f-H':'status-due'))?>"><?=e(ucfirst($user['status']))?></span></td><td><?php if($user['status']==='pending'):?><div class="actions"><form method="post"><input type="hidden" name="action" value="approve_user"><input type="hidden" name="user_id" value="<?=$user['id']?>"><button>Approve</button></form><form method="post"><input type="hidden" name="action" value="reject_user"><input type="hidden" name="user_id" value="<?=$user['id']?>"><button class="btn danger">Reject</button></form></div><?php elseif($user['status']==='approved'):?><form method="post" class="actions" onsubmit="return confirm('Reset this user password?')"><input type="hidden" name="action" value="reset_user_password"><input type="hidden" name="user_id" value="<?=$user['id']?>"><input type="password" name="new_password" minlength="8" placeholder="New password" required><button>Reset Password</button></form><?php else:?>—<?php endif;?></td></tr><?php endforeach;?>
 </tbody></table></div></section>
 <section class="panel" style="margin-top:16px"><h2>Administrator Password</h2><form method="post" class="grid" style="max-width:720px"><input type="hidden" name="action" value="change_admin_password"><label class="field">Current Password<input type="password" name="current_password" required></label><span></span><label class="field">New Password<input type="password" name="new_password" minlength="8" required></label><label class="field">Confirm New Password<input type="password" name="confirm_password" minlength="8" required></label><span></span><button>Change Password</button></form></section>
-<section class="panel" style="margin-top:16px"><h2>Latest Transaction Audit Log</h2><div class="table-wrap" style="max-height:420px"><table class="due-table"><thead><tr><th>Date & Time (IST)</th><th>Employee</th><th>Name</th><th>Action</th><th>Details</th></tr></thead><tbody><?php foreach(array_slice(array_reverse($data['audit_logs']),0,50) as $audit):?><tr><td><?=e(date('d/m/Y H:i:s',strtotime($audit['timestamp'])))?></td><td><?=e((string)$audit['employee_no'])?></td><td><?=e((string)$audit['name'])?></td><td><?=e((string)$audit['action'])?></td><td><?=e((string)$audit['details'])?></td></tr><?php endforeach;?></tbody></table></div></section>
+<section class="panel" style="margin-top:16px"><h2>Latest Transaction Audit Log</h2><div class="table-wrap" style="max-height:420px"><table class="due-table"><thead><tr><th>Date & Time (PHT)</th><th>Employee</th><th>Name</th><th>Action</th><th>Details</th></tr></thead><tbody><?php foreach(array_slice(array_reverse($data['audit_logs']),0,50) as $audit):?><tr><td><?=e(date('d/m/Y H:i:s',strtotime($audit['timestamp'])))?></td><td><?=e((string)$audit['employee_no'])?></td><td><?=e((string)$audit['name'])?></td><td><?=e((string)$audit['action'])?></td><td><?=e((string)$audit['details'])?></td></tr><?php endforeach;?></tbody></table></div></section>
 <?php endif;?></main>
 
 <?php if(($currentUser['role']??'')==='admin'):?><div class="modal" id="auxModal"><div class="modal-box" style="width:min(900px,96vw);max-height:92vh;overflow:auto"><h2 id="auxTitle">Add Equipment / Aux Information</h2><form method="post" class="grid"><input type="hidden" name="action" value="save_aux_information"><input type="hidden" name="id" id="auxId" value="0"><?php foreach($data['aux_headers'] as $fieldIndex=>$header):?><label class="field <?=in_array($fieldIndex,[1,3,8],true)?'full':''?>"><?=e((string)$header)?><input name="values[<?=$fieldIndex?>]" id="auxField<?=$fieldIndex?>" <?=in_array($fieldIndex,[0,4],true)?'autocomplete="off"':''?>></label><?php endforeach;?><button type="button" class="btn secondary" onclick="closeModal('auxModal')">Cancel</button><button>Save Information</button></form></div></div><?php endif;?>
