@@ -482,6 +482,68 @@ function scheduleFromEnrollmentDate(string $enrollmentDate, array $frequencies, 
     return ['schedule'=>$schedule,'due_dates'=>$dueDates];
 }
 
+/** Send one transactional email through Brevo's HTTPS API. */
+function sendBrevoTransactionalEmail(string $recipient, string $recipientName, string $subject, string $textContent): array {
+    if (!filter_var($recipient, FILTER_VALIDATE_EMAIL)) {
+        return ['ok'=>false, 'message'=>'Recipient email address is invalid.'];
+    }
+    if (!function_exists('curl_init')) {
+        error_log('PM Brevo API error: PHP cURL extension is unavailable.');
+        return ['ok'=>false, 'message'=>'PHP cURL is unavailable. Check the Docker build and redeploy.'];
+    }
+
+    $apiKey=trim((string)getenv('BREVO_API_KEY'));
+    $fromEmail=trim((string)getenv('BREVO_FROM_EMAIL'));
+    $fromName=trim((string)(getenv('BREVO_FROM_NAME') ?: 'PM Scheduling System'));
+    $missing=[];
+    if ($apiKey==='') $missing[]='BREVO_API_KEY';
+    if (!filter_var($fromEmail,FILTER_VALIDATE_EMAIL)) $missing[]='BREVO_FROM_EMAIL (must be a verified Brevo sender)';
+    if ($missing) return ['ok'=>false, 'message'=>'Missing or invalid Render environment setting(s): '.implode(', ',$missing).'.'];
+
+    $payload=[
+        'sender'=>['name'=>$fromName,'email'=>$fromEmail],
+        'to'=>[['email'=>$recipient,'name'=>$recipientName]],
+        'subject'=>$subject,
+        'textContent'=>$textContent,
+    ];
+    $json=json_encode($payload, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);
+    if ($json===false) return ['ok'=>false, 'message'=>'Could not encode the email request.'];
+
+    $curl=curl_init('https://api.brevo.com/v3/smtp/email');
+    if ($curl===false) return ['ok'=>false, 'message'=>'Could not initialize the HTTPS request to Brevo.'];
+    curl_setopt_array($curl,[
+        CURLOPT_POST=>true,
+        CURLOPT_POSTFIELDS=>$json,
+        CURLOPT_HTTPHEADER=>[
+            'accept: application/json',
+            'api-key: '.$apiKey,
+            'content-type: application/json',
+        ],
+        CURLOPT_RETURNTRANSFER=>true,
+        CURLOPT_CONNECTTIMEOUT=>10,
+        CURLOPT_TIMEOUT=>30,
+        CURLOPT_SSL_VERIFYPEER=>true,
+        CURLOPT_SSL_VERIFYHOST=>2,
+    ]);
+    $response=curl_exec($curl);
+    $curlError=curl_error($curl);
+    $httpCode=(int)curl_getinfo($curl,CURLINFO_HTTP_CODE);
+    curl_close($curl);
+
+    if ($response===false) {
+        error_log('PM Brevo API connection failed: '.$curlError);
+        return ['ok'=>false, 'message'=>'Could not connect to Brevo over HTTPS: '.$curlError];
+    }
+    $decoded=json_decode((string)$response,true);
+    if ($httpCode<200 || $httpCode>=300) {
+        $detail=is_array($decoded) ? (string)($decoded['message']??$decoded['code']??'') : '';
+        $detail=trim($detail);
+        error_log('PM Brevo API rejected email. HTTP '.$httpCode.($detail!==''?': '.$detail:''));
+        return ['ok'=>false, 'message'=>'Brevo API returned HTTP '.$httpCode.($detail!==''?': '.$detail:'.').' Check the API key, sender verification, and Brevo transactional email status.'];
+    }
+    return ['ok'=>true, 'message'=>'Email accepted by Brevo for '.$recipient.'. Check the inbox and spam folder.'];
+}
+
 function sendDueEmailNotifications(array &$data, bool $force=false): array {
     $year=(int)$data['year']; $workWeek=(int)date('W'); $today=date('Y-m-d'); $completed=[]; $due=[];
     foreach (($data['logs']??[]) as $log) if ((int)($log['year']??0)===$year) $completed[$log['equipment_id'].'-'.$log['week']]=true;
@@ -502,105 +564,24 @@ function sendDueEmailNotifications(array &$data, bool $force=false): array {
     $message="Preventive Maintenance alarms due within 2 days or overdue for WW".str_pad((string)$workWeek,2,'0',STR_PAD_LEFT)."\n\n".implode("\n",$due)."\n\nGenerated: ".date('d/m/Y H:i:s').' PHT';
     $sent=0; $failed=0;
     if (!isset($data['email_delivery']) || !is_array($data['email_delivery'])) $data['email_delivery']=[];
-    $smtpHost=trim((string)(getenv('SMTP_HOST') ?: 'smtp-relay.brevo.com'));
-    $smtpPort=(int)(getenv('SMTP_PORT') ?: 587);
-    $smtpUsername=trim((string)getenv('SMTP_USERNAME'));
-    $smtpPassword=(string)getenv('SMTP_PASSWORD');
-    $smtpEncryption=strtolower(trim((string)(getenv('SMTP_ENCRYPTION') ?: 'tls')));
-    $fromEmail=trim((string)getenv('SMTP_FROM_EMAIL'));
-    $fromName=trim((string)(getenv('SMTP_FROM_NAME') ?: 'PM Scheduling System'));
-    $smtpConfigured=class_exists(\PHPMailer\PHPMailer\PHPMailer::class)
-        && $smtpHost!=='' && $smtpPort>0 && $smtpUsername!=='' && $smtpPassword!==''
-        && filter_var($fromEmail,FILTER_VALIDATE_EMAIL) && in_array($smtpEncryption,['tls','ssl'],true);
     foreach ($data['users'] as $user) {
         $email=(string)($user['email']??''); if (($user['status']??'')!=='approved' || empty($user['email_notifications']) || !filter_var($email,FILTER_VALIDATE_EMAIL)) continue;
         $deliveryKey=$today.'|'.strtolower($email);
         if (!$force && isset($data['email_delivery'][$deliveryKey])) continue;
-        $ok=false;
-        if (!$smtpConfigured) {
-            error_log('PM email not sent: Brevo SMTP is not fully configured. Check SMTP_* environment variables and PHPMailer installation.');
-        } else {
-            try {
-                $mailer=new \PHPMailer\PHPMailer\PHPMailer(true);
-                $mailer->isSMTP();
-                $mailer->Host=$smtpHost;
-                $mailer->SMTPAuth=true;
-                $mailer->Username=$smtpUsername;
-                $mailer->Password=$smtpPassword;
-                $mailer->Port=$smtpPort;
-                $mailer->SMTPSecure=$smtpEncryption=== 'ssl'
-                    ? \PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_SMTPS
-                    : \PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_STARTTLS;
-                $mailer->CharSet='UTF-8';
-                $mailer->setFrom($fromEmail,$fromName);
-                $mailer->addAddress($email);
-                $mailer->Subject=$subject;
-                $mailer->Body=$message;
-                $mailer->isHTML(false);
-                $mailer->send();
-                $ok=true;
-            } catch (\Throwable $mailError) {
-                error_log('PM Brevo SMTP delivery failed for '. $email . ': ' . $mailError->getMessage());
-            }
-        }
-        $ok?$sent++:$failed++;
-        $data['email_delivery'][$deliveryKey]=['timestamp'=>date('c'),'status'=>$ok?'sent':'failed','due_count'=>count($due)];
+        $result=sendBrevoTransactionalEmail($email,(string)($user['name']??''),$subject,$message);
+        $result['ok']?$sent++:$failed++;
+        if (!$result['ok']) error_log('PM Brevo API delivery failed for '.$email.': '.$result['message']);
+        $data['email_delivery'][$deliveryKey]=['timestamp'=>date('c'),'status'=>$result['ok']?'sent':'failed','due_count'=>count($due)];
     }
     return ['sent'=>$sent,'failed'=>$failed,'due'=>count($due)];
 }
 
-/** Send a standalone SMTP test message to the currently logged-in administrator. */
-function sendSmtpTestEmail(string $recipient, string $recipientName='Administrator'): array {
-    if (!filter_var($recipient, FILTER_VALIDATE_EMAIL)) {
-        return ['ok'=>false, 'message'=>'Add a valid email address to your Admin profile first.'];
-    }
-    if (!class_exists(\PHPMailer\PHPMailer\PHPMailer::class)) {
-        error_log('PM email test failed: PHPMailer autoloader/class is unavailable.');
-        return ['ok'=>false, 'message'=>'PHPMailer is not installed. Check the Composer install step in the Render build logs.'];
-    }
-
-    $host=trim((string)(getenv('SMTP_HOST') ?: 'smtp-relay.brevo.com'));
-    $port=(int)(getenv('SMTP_PORT') ?: 587);
-    $username=trim((string)getenv('SMTP_USERNAME'));
-    $password=(string)getenv('SMTP_PASSWORD');
-    $encryption=strtolower(trim((string)(getenv('SMTP_ENCRYPTION') ?: 'tls')));
-    $fromEmail=trim((string)getenv('SMTP_FROM_EMAIL'));
-    $fromName=trim((string)(getenv('SMTP_FROM_NAME') ?: 'PM Scheduling System'));
-
-    $missing=[];
-    if ($host==='') $missing[]='SMTP_HOST';
-    if ($port<1) $missing[]='SMTP_PORT';
-    if ($username==='') $missing[]='SMTP_USERNAME';
-    if ($password==='') $missing[]='SMTP_PASSWORD';
-    if (!filter_var($fromEmail,FILTER_VALIDATE_EMAIL)) $missing[]='SMTP_FROM_EMAIL (must be a valid verified sender address)';
-    if (!in_array($encryption,['tls','ssl'],true)) $missing[]='SMTP_ENCRYPTION (use tls or ssl)';
-    if ($missing) return ['ok'=>false, 'message'=>'Missing or invalid Render environment setting(s): '.implode(', ',$missing).'.'];
-
-    try {
-        $mailer=new \PHPMailer\PHPMailer\PHPMailer(true);
-        $mailer->isSMTP();
-        $mailer->Host=$host;
-        $mailer->SMTPAuth=true;
-        $mailer->Username=$username;
-        $mailer->Password=$password;
-        $mailer->Port=$port;
-        $mailer->SMTPSecure=$encryption==='ssl'
-            ? \PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_SMTPS
-            : \PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_STARTTLS;
-        $mailer->Timeout=20;
-        $mailer->CharSet='UTF-8';
-        $mailer->setFrom($fromEmail,$fromName);
-        $mailer->addAddress($recipient,$recipientName);
-        $mailer->isHTML(false);
-        $mailer->Subject='PM Scheduling System - SMTP Test';
-        $mailer->Body="This is a test email from the PM Scheduling System.\n\nIf you received this message, the SMTP configuration is working.\n\nSent: ".date('d/m/Y H:i:s').' PHT';
-        $mailer->send();
-        return ['ok'=>true, 'message'=>'Test email accepted by the SMTP server for '.$recipient.'. Check the inbox and spam folder.'];
-    } catch (\Throwable $mailError) {
-        // PHPMailer error text is useful for diagnostics; never log the SMTP password.
-        error_log('PM SMTP test failed: '.$mailError->getMessage());
-        return ['ok'=>false, 'message'=>'SMTP test failed: '.$mailError->getMessage()];
-    }
+/** Send a standalone Brevo API test message to the currently logged-in administrator. */
+function sendBrevoTestEmail(string $recipient, string $recipientName='Administrator'): array {
+    $message="This is a test email from the PM Scheduling System.\n\nIf you received this message, the Brevo API configuration is working.\n\nSent: ".date('d/m/Y H:i:s').' PHT';
+    $result=sendBrevoTransactionalEmail($recipient,$recipientName,'PM Scheduling System - Brevo API Test',$message);
+    if (!$result['ok']) error_log('PM Brevo API test failed: '.$result['message']);
+    return $result;
 }
 
 function auxInformationHeaders(): array {
@@ -1041,8 +1022,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
     if ($action === 'send_test_email') {
         $adminEmail=trim((string)($currentUser['email']??''));
-        $testResult=sendSmtpTestEmail($adminEmail,(string)($currentUser['name']??'Administrator'));
-        auditAction($data,$currentUser,'SEND_TEST_EMAIL',$testResult['ok']?'SMTP test accepted for '.$adminEmail:$testResult['message']);
+        $testResult=sendBrevoTestEmail($adminEmail,(string)($currentUser['name']??'Administrator'));
+        auditAction($data,$currentUser,'SEND_TEST_EMAIL',$testResult['ok']?'Brevo API test accepted for '.$adminEmail:$testResult['message']);
         saveData($data);
         setFlash($testResult['message']);
         header('Location: '.$_SERVER['PHP_SELF'].'?view=admin'); exit;
@@ -1502,7 +1483,7 @@ table{border-collapse:separate;border-spacing:0;min-width:2400px;width:100%;font
 <section class="panel"><h2>My Profile</h2><div style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap"><?php if(!empty($currentUser['photo'])):?><img class="approval-photo" style="width:120px;height:120px" src="<?=e($currentUser['photo'])?>" alt="Profile photo"><?php endif;?><form method="post" enctype="multipart/form-data" class="grid" style="max-width:720px;flex:1"><input type="hidden" name="action" value="update_profile"><label class="field">Name<input value="<?=e($currentUser['name'])?>" readonly></label><label class="field">Employee No.<input value="<?=e($currentUser['employee_no'])?>" readonly></label><label class="field">Designation<input value="<?=e($currentUser['designation'])?>" readonly></label><label class="field">Email Address<input type="email" name="email" value="<?=e((string)($currentUser['email']??''))?>" required></label><label class="field full"><span><input type="checkbox" name="email_notifications" value="1" <?=!empty($currentUser['email_notifications'])?'checked':''?>> Receive PM due email notifications</span></label><label class="field full">Upload New Profile Photo<input type="file" name="profile_photo" accept="image/jpeg,image/png,image/webp"><small>Leave blank to keep the current photo. Maximum 2 MB.</small></label><span></span><button>Update Profile</button></form></div></section>
 <section class="panel" style="margin-top:16px"><h2>Change My Password</h2><form method="post" class="grid" style="max-width:720px"><input type="hidden" name="action" value="change_own_password"><label class="field full">Current Password<input type="password" name="current_password" required></label><label class="field">New Password<input type="password" name="new_password" minlength="8" required></label><label class="field">Confirm New Password<input type="password" name="confirm_password" minlength="8" required></label><span></span><button>Change Password</button></form></section>
 <?php else:?>
-<section class="panel"><h2>PM Email Notifications</h2><p>Automatic due-list emails are sent to approved employees who have a valid email address and enabled notifications, when PM items are due within 2 days or overdue.</p><div style="display:flex;gap:12px;flex-wrap:wrap"><form method="post"><input type="hidden" name="action" value="send_test_email"><button class="btn secondary">Send SMTP Test Email to Admin</button></form><form method="post"><input type="hidden" name="action" value="send_due_email"><button>Send Due Email Now</button></form></div><small>SMTP test recipient: <?=e((string)($currentUser['email']??'No Admin email set — update My Profile first'))?>. The SMTP test works even when there are no due PM items.</small></section>
+<section class="panel"><h2>PM Email Notifications</h2><p>Automatic due-list emails are sent to approved employees who have a valid email address and enabled notifications, when PM items are due within 2 days or overdue.</p><div style="display:flex;gap:12px;flex-wrap:wrap"><form method="post"><input type="hidden" name="action" value="send_test_email"><button class="btn secondary">Send Brevo API Test Email to Admin</button></form><form method="post"><input type="hidden" name="action" value="send_due_email"><button>Send Due Email Now</button></form></div><small>SMTP test recipient: <?=e((string)($currentUser['email']??'No Admin email set — update My Profile first'))?>. The SMTP test works even when there are no due PM items.</small></section>
 <section class="panel" style="margin-top:16px"><h2>User Enrollment Approval and Accounts</h2><div class="table-wrap" style="max-height:none"><table class="due-table"><thead><tr><th>Photo</th><th>Name</th><th>Employee No.</th><th>Email</th><th>Notify</th><th>Designation</th><th>Requested</th><th>Status</th><th>Approval / Password Reset</th></tr></thead><tbody>
 <?php foreach($data['users'] as $user):if((int)$user['id']===(int)$currentUser['id'])continue;?><tr><td><?php if(!empty($user['photo'])):?><img class="approval-photo" src="<?=e($user['photo'])?>" alt="<?=e($user['name'])?> photo"><?php else:?>No photo<?php endif;?></td><td><?=e($user['name'])?></td><td><?=e($user['employee_no'])?></td><td><?=e((string)($user['email']??''))?></td><td><?=!empty($user['email_notifications'])?'Yes':'No'?></td><td><?=e($user['designation'])?></td><td><?=e(date('d/m/Y H:i',strtotime($user['created_at'])))?></td><td><span class="badge <?=($user['status']==='approved'?'status-done':($user['status']==='pending'?'f-H':'status-due'))?>"><?=e(ucfirst($user['status']))?></span></td><td><?php if($user['status']==='pending'):?><div class="actions"><form method="post"><input type="hidden" name="action" value="approve_user"><input type="hidden" name="user_id" value="<?=$user['id']?>"><button>Approve</button></form><form method="post"><input type="hidden" name="action" value="reject_user"><input type="hidden" name="user_id" value="<?=$user['id']?>"><button class="btn danger">Reject</button></form></div><?php elseif($user['status']==='approved'):?><form method="post" class="actions" onsubmit="return confirm('Reset this user password?')"><input type="hidden" name="action" value="reset_user_password"><input type="hidden" name="user_id" value="<?=$user['id']?>"><input type="password" name="new_password" minlength="8" placeholder="New password" required><button>Reset Password</button></form><?php else:?>—<?php endif;?></td></tr><?php endforeach;?>
 </tbody></table></div></section>
