@@ -3,7 +3,7 @@ services:
     name: pm-scheduling-system
     runtime: docker
     plan: starter
-    region: singapore
+    region: oregon
     dockerfilePath: ./Dockerfile
     healthCheckPath: /
     autoDeploy: true
@@ -12,8 +12,6 @@ services:
         value: /var/data
       - key: PM_TIMEZONE
         value: Asia/Kolkata
-      - key: PM_ADMIN_INITIAL_PASSWORD
-        sync: false
       - key: BREVO_API_KEY
         sync: false
       - key: BREVO_FROM_EMAIL

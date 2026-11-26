@@ -9,7 +9,8 @@ RUN apt-get update \
         unzip \
         libzip-dev \
         libcurl4-openssl-dev \
-    && docker-php-ext-install zip curl \
+        libpq-dev \
+    && docker-php-ext-install zip curl pdo_pgsql \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
@@ -34,9 +35,10 @@ RUN composer validate --no-check-publish \
     && composer clear-cache
 
 COPY PMsched.php /var/www/html/index.php
-RUN mkdir -p /opt/pmsched-seed /var/data
-COPY pm_schedule_data.json /opt/pmsched-seed/pm_schedule_data.json
-COPY pm_user_photos/ /opt/pmsched-seed/pm_user_photos/
+RUN mkdir -p /var/data
+COPY database.php /var/www/html/database.php
+COPY database-bootstrap.php /var/www/html/database-bootstrap.php
+COPY pm_schedule_data.json /var/www/html/pm_schedule_data.json
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh \

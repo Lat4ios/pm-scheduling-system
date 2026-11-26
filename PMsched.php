@@ -3,7 +3,7 @@
  Preventive Maintenance Electronic System - single-file PHP application for XAMPP
  Put this file in C:\\xampp\\htdocs\\pm_schedule\\index.php, then open
  http://localhost/pm_schedule/
- The application creates pm_schedule_data.json beside this file.
+ The application uses PostgreSQL when DATABASE_URL is configured; local development can use pm_schedule_data.json.
 */
 declare(strict_types=1);
 
@@ -26,6 +26,7 @@ date_default_timezone_set(getenv('PM_TIMEZONE') ?: 'Asia/Kolkata');
 $dataDirectory = rtrim(getenv('PM_DATA_DIR') ?: __DIR__, DIRECTORY_SEPARATOR);
 define('DATA_FILE', $dataDirectory . '/pm_schedule_data.json');
 define('USER_PHOTO_DIR', $dataDirectory . '/pm_user_photos');
+require_once __DIR__ . '/database.php';
 
 if (empty($_SESSION['csrf_token'])) {
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
@@ -706,31 +707,88 @@ function equipmentKey(string $name): string {
 }
 
 function saveData(array $data): void {
-    $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
-    if ($json === false || file_put_contents(DATA_FILE, $json, LOCK_EX) === false) {
+    if (pm_db_enabled()) {
+        $expected = $GLOBALS['PM_DB_REVISION'] ?? null;
+        if (!is_int($expected)) {
+            throw new RuntimeException('Database state was not loaded before saving. Refresh the page and try again.');
+        }
+        $json = json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        $stmt = pm_db()->prepare('UPDATE pm_app_state SET data = CAST(:data AS JSONB), revision = revision + 1, updated_at = NOW() WHERE id = 1 AND revision = :revision');
+        $stmt->execute([':data' => $json, ':revision' => $expected]);
+        if ($stmt->rowCount() !== 1) {
+            throw new RuntimeException('The data changed in another session. Nothing was overwritten. Refresh the page and repeat your last action.');
+        }
+        $GLOBALS['PM_DB_REVISION'] = $expected + 1;
+        return;
+    }
+
+    $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+    if (file_put_contents(DATA_FILE, $json, LOCK_EX) === false) {
         throw new RuntimeException('Cannot write pm_schedule_data.json. Allow write permission for this folder.');
     }
 }
 
 function loadData(): array {
-    if (!file_exists(DATA_FILE)) saveData(initialData());
-    $data = json_decode((string)file_get_contents(DATA_FILE), true);
-    if (!is_array($data)) { $data = initialData(); saveData($data); }
+    if (pm_db_enabled()) {
+        $stmt = pm_db()->query('SELECT data, revision FROM pm_app_state WHERE id = 1');
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$row) {
+            throw new RuntimeException('PostgreSQL has not been initialized. The existing JSON data was not changed. Check the database bootstrap logs.');
+        }
+        $data = json_decode((string)$row['data'], true, 512, JSON_THROW_ON_ERROR);
+        if (!is_array($data)) throw new RuntimeException('PostgreSQL contains invalid application data. No reset was attempted.');
+        $GLOBALS['PM_DB_REVISION'] = (int)$row['revision'];
+    } else {
+        if (!file_exists(DATA_FILE)) saveData(initialData());
+        $data = json_decode((string)file_get_contents(DATA_FILE), true);
+        if (!is_array($data)) { throw new RuntimeException('pm_schedule_data.json is invalid. The file was not replaced with empty data.'); }
+    }
+
+    // Keep the full existing dataset when updating the source revision. The former
+    // migration rebuilt the top-level structure and could discard users, audit
+    // history, auxiliary records, checklist templates, and logs for unmatched IDs.
     if (($data['source_revision'] ?? '') !== SOURCE_REVISION) {
-        $old=$data; $data=initialData(); $oldByName=[]; $idMap=[];
-        foreach (($old['equipment'] ?? []) as $oldEq) $oldByName[equipmentKey((string)($oldEq['name']??''))]=$oldEq;
-        foreach ($data['equipment'] as &$newEq) {
-            $key=equipmentKey($newEq['name']);
-            if (isset($oldByName[$key])) {
-                $matched=$oldByName[$key];
-                $newEq['due_dates']=array_pad(array_slice($matched['due_dates']??[],0,52),52,'');
-                $idMap[(int)($matched['id']??0)]=(int)$newEq['id'];
+        $old = $data;
+        $fresh = initialData();
+        $oldEquipment = is_array($old['equipment'] ?? null) ? $old['equipment'] : [];
+        $byCode = []; $byName = [];
+        foreach ($oldEquipment as $item) {
+            if (!is_array($item)) continue;
+            $code = strtoupper(trim((string)($item['code'] ?? '')));
+            $name = equipmentKey((string)($item['name'] ?? ''));
+            if ($code !== '') $byCode[$code] = $item;
+            if ($name !== '') $byName[$name] = $item;
+        }
+        $usedIds = [];
+        foreach ($oldEquipment as $item) if (is_array($item) && isset($item['id'])) $usedIds[(int)$item['id']] = true;
+        $nextId = max((int)($old['next_id'] ?? 1), ($usedIds ? max(array_keys($usedIds)) + 1 : 1));
+        $mergedEquipment = [];
+        $matchedOldIds = [];
+        foreach ($fresh['equipment'] as $base) {
+            $code = strtoupper(trim((string)$base['code']));
+            $name = equipmentKey((string)$base['name']);
+            $matched = ($code !== '' ? ($byCode[$code] ?? null) : null) ?? ($byName[$name] ?? null);
+            if (is_array($matched)) {
+                if (isset($matched['id'])) $matchedOldIds[(int)$matched['id']] = true;
+                $merged = array_merge($base, $matched);
+                $merged['due_dates'] = array_pad(array_slice($matched['due_dates'] ?? $base['due_dates'], 0, 52), 52, '');
+                $mergedEquipment[] = $merged;
+            } else {
+                $base['id'] = $nextId++;
+                $mergedEquipment[] = $base;
             }
         }
-        unset($newEq); $data['logs']=[];
-        foreach (($old['logs']??[]) as $log) if (isset($idMap[(int)($log['equipment_id']??0)])) {
-            $log['equipment_id']=$idMap[(int)$log['equipment_id']]; $data['logs'][]=$log;
+        $knownCodes = array_fill_keys(array_map(fn($item) => strtoupper(trim((string)($item['code'] ?? ''))), $mergedEquipment), true);
+        foreach ($oldEquipment as $item) {
+            if (!is_array($item)) continue;
+            $oldId = (int)($item['id'] ?? 0);
+            $code = strtoupper(trim((string)($item['code'] ?? '')));
+            if (!isset($matchedOldIds[$oldId]) && ($code === '' || !isset($knownCodes[$code]))) $mergedEquipment[] = $item;
         }
+        $data = array_merge($fresh, $old);
+        $data['equipment'] = $mergedEquipment;
+        $data['next_id'] = max($nextId, 1 + max(array_map(fn($item) => (int)($item['id'] ?? 0), $mergedEquipment)));
+        $data['source_revision'] = SOURCE_REVISION;
         saveData($data);
     }
     return $data;
@@ -772,7 +830,7 @@ function saveEnrollmentPhoto(string $field='photo'): array {
 
 
 // Render runs this file in CLI mode from its daily cron task. It uses the same
-// persistent JSON data file and Brevo API configuration as the web service.
+// PostgreSQL state and Brevo API configuration as the web service.
 if (PHP_SAPI === 'cli' && getenv('PM_RUN_REMINDERS') === '1') {
     $cronData=loadData();
     $cronResult=sendDueEmailNotifications($cronData,false);
